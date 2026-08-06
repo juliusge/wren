@@ -158,15 +158,37 @@ fn ensure_one(home: &Path, model: &ModelFile) -> Result<()> {
         model.size
     );
 
-    let bytes = reqwest::blocking::Client::builder()
+    // ModelScope's LFS CDN returns 403 unless the request looks browser-like
+    // (Referer + User-Agent) when following the API redirect.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::REFERER,
+        "https://www.modelscope.cn/"
+            .parse()
+            .expect("valid Referer header"),
+    );
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            .parse()
+            .expect("valid User-Agent header"),
+    );
+
+    let response = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(1800))
+        .default_headers(headers)
         .build()
         .context("Failed to build HTTP client")?
         .get(&url)
         .send()
-        .with_context(|| format!("Failed to request {url}"))?
+        .with_context(|| format!("Failed to request {url}"))?;
+
+    let status = response.status().as_u16();
+    let final_url = response.url().to_string();
+
+    let bytes = response
         .error_for_status()
-        .with_context(|| format!("Download failed for {url}"))?
+        .with_context(|| format!("Download failed for {url} (final={final_url}, status={status})"))?
         .bytes()
         .with_context(|| format!("Failed to read body for {url}"))?;
 

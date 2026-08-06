@@ -17,6 +17,45 @@ pub struct EmbeddingResult {
     pub total_tokens: i64,
 }
 
+/// Default embedding model for a provider (used when unset or incompatible).
+pub fn default_embedding_model(provider: &str) -> String {
+    match provider {
+        "ollama" | "ollama_cloud" => "nomic-embed-text".to_string(),
+        "gemini" => "text-embedding-004".to_string(),
+        _ => "text-embedding-3-small".to_string(),
+    }
+}
+
+/// Build the OpenAI-compatible embeddings URL for a provider.
+///
+/// Ollama chat uses the native API root (`http://localhost:11434`), but
+/// embeddings require the OpenAI-compat path under `/v1/embeddings`.
+pub fn embedding_endpoint_url(config: &EmbeddingConfig) -> String {
+    let base = config.base_url.trim_end_matches('/');
+    match config.provider_type.as_str() {
+        "ollama" | "ollama_cloud" => {
+            if base.ends_with("/v1") {
+                format!("{base}/embeddings")
+            } else {
+                format!("{base}/v1/embeddings")
+            }
+        }
+        _ => format!("{base}/embeddings"),
+    }
+}
+
+/// If the stored embedding model is unknown for this provider, fall back to
+/// the provider default so dimension probes and indexing can proceed.
+fn coerce_embedding_model(provider: &str, model: &str) -> String {
+    if model.is_empty() || known_dimension(provider, model).is_none() {
+        let fallback = default_embedding_model(provider);
+        if known_dimension(provider, &fallback).is_some() {
+            return fallback;
+        }
+    }
+    model.to_string()
+}
+
 /// Resolve embedding config from wren's settings.
 pub async fn resolve_embedding_config(
     db: &sqlx::SqlitePool,
@@ -25,9 +64,10 @@ pub async fn resolve_embedding_config(
         .await
         .unwrap_or_else(|| "openai".to_string());
 
-    let model = get_setting(db, "cloud_embedding_model")
+    let raw_model = get_setting(db, "cloud_embedding_model")
         .await
-        .unwrap_or_else(|| "text-embedding-3-small".to_string());
+        .unwrap_or_else(|| default_embedding_model(&provider_type));
+    let model = coerce_embedding_model(&provider_type, &raw_model);
 
     let api_key = get_setting(db, &format!("llm_api_key_{}", provider_type))
         .await
@@ -88,7 +128,7 @@ pub async fn embed_batch(
     }
 
     // OpenAI-compatible API (works for OpenAI, Ollama, oMLX, Cohere, Jina, Voyage, Together, etc.)
-    let url = format!("{}/embeddings", config.base_url.trim_end_matches('/'));
+    let url = embedding_endpoint_url(config);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300)) // 5 min for local models

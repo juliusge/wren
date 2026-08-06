@@ -115,17 +115,34 @@ pub fn find_section_ranges_with_lines(
         last.raw_text = full_text[last.start_offset..last.end_offset].to_string();
     }
 
-    // Any text before the first discovered section (title pages, author info, etc.)
-    // is intentionally dropped — the LLM discovers meaningful sections, and pre-section
-    // content (addresses, affiliations) doesn't warrant its own section.
-    if let Some(first) = ranges.first()
-        && first.start_offset > 0 {
+    // Small front-matter gaps (title/authors) can be dropped. Large gaps usually mean
+    // discovery missed early sections — keep that text as a preamble section.
+    const PREAMBLE_KEEP_THRESHOLD: usize = 500;
+    if let Some(first) = ranges.first() {
+        let gap = first.start_offset;
+        if gap > PREAMBLE_KEEP_THRESHOLD {
+            let first_name = first.name.clone();
+            let preamble = SectionRange {
+                name: "Preamble".to_string(),
+                level: 1,
+                start_offset: 0,
+                end_offset: gap,
+                raw_text: full_text[..gap].to_string(),
+            };
+            ranges.insert(0, preamble);
+            tracing::info!(
+                "Preserved {} chars of pre-section content as 'Preamble' before '{}'",
+                gap,
+                first_name,
+            );
+        } else if gap > 0 {
             tracing::debug!(
                 "Dropping {} chars of pre-section content before '{}'",
-                first.start_offset,
+                gap,
                 first.name,
             );
         }
+    }
 
     ranges
 }
@@ -750,5 +767,22 @@ mod tests {
         assert_eq!(ranges.len(), 2);
         assert_eq!(ranges[0].name, "Section A");
         assert_eq!(ranges[1].name, "Section B");
+    }
+
+    #[test]
+    fn test_large_preamble_is_preserved() {
+        let preamble = "A".repeat(600);
+        let text = format!("{preamble}\n\n## 4 Conclusion\nFinal thoughts here.");
+        let sections = vec![DiscoveredSection {
+            name: "## 4 Conclusion".to_string(),
+            level: 1,
+            starts_with: "## 4 Conclusion".to_string(),
+            line: None,
+        }];
+        let ranges = find_section_ranges(&sections, &text);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].name, "Preamble");
+        assert!(ranges[0].raw_text.len() >= 600);
+        assert_eq!(ranges[1].name, "## 4 Conclusion");
     }
 }

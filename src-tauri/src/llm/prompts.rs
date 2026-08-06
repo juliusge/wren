@@ -1,5 +1,22 @@
 use crate::llm::provider::{ChatMessage, MessageRole, ToolDefinition};
 
+/// Append a concrete JSON instance example for JSON-mode fallbacks.
+///
+/// Dumping a JSON Schema causes many local models (e.g. llama3.2 via Ollama) to
+/// echo the schema shell instead of returning an instance.
+fn append_json_instance_example(messages: &mut [ChatMessage], example: &str) {
+    if let Some(system) = messages.first_mut() {
+        system.content.push_str(
+            " Respond with a single JSON object only — never return a JSON Schema definition.",
+        );
+    }
+    if let Some(user_msg) = messages.last_mut() {
+        user_msg.content.push_str(&format!(
+            "\n\nRespond with ONLY a JSON object like this example (fill in real values; do not return a schema):\n{example}"
+        ));
+    }
+}
+
 // ── Stage 1: Classification ─────────────────────────────────────────
 
 /// Build messages + tool definition for document classification.
@@ -93,16 +110,20 @@ pub fn classification_prompt_json(
     abstract_text: Option<&str>,
     item_type: Option<&str>,
 ) -> Vec<ChatMessage> {
-    let (mut messages, tools) = classification_prompt(text_sample, title, authors, abstract_text, item_type);
+    let (mut messages, _tools) = classification_prompt(text_sample, title, authors, abstract_text, item_type);
 
-    // Append schema to user message
-    let schema = &tools[0].parameters;
-    if let Some(user_msg) = messages.last_mut() {
-        user_msg.content.push_str(&format!(
-            "\n\nRespond with a JSON object matching this schema:\n{}",
-            serde_json::to_string_pretty(schema).unwrap_or_default()
-        ));
+    // JSON mode must not ask for tool calls — local models often echo the schema
+    // when given a JSON Schema definition instead of an instance example.
+    if let Some(system) = messages.first_mut() {
+        system.content = "You are a document analysis assistant. Analyze the beginning of a document \
+                          and its metadata. Classify its type and language. Respond with a single \
+                          JSON object only — never return a JSON Schema."
+            .to_string();
     }
+    append_json_instance_example(
+        &mut messages,
+        r#"{"document_type": "research_paper", "confidence": 0.9, "language": "en", "reasoning": "brief reason"}"#,
+    );
 
     messages
 }
@@ -210,39 +231,10 @@ pub fn discovery_prompt_json(
         discovery_prompt_chunk(text, doc_type_hint, carry_forward)
     };
 
-    let schema = serde_json::json!({
-        "type": "object",
-        "required": ["sections"],
-        "properties": {
-            "sections": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["name", "level", "starts_with"],
-                    "properties": {
-                        "name": {"type": "string"},
-                        "level": {"type": "integer"},
-                        "line": {"type": "integer"},
-                        "starts_with": {"type": "string"}
-                    }
-                }
-            },
-            "partial_section": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "last_content_snippet": {"type": "string"}
-                }
-            }
-        }
-    });
-
-    if let Some(user_msg) = messages.last_mut() {
-        user_msg.content.push_str(&format!(
-            "\n\nRespond with a JSON object matching this schema:\n{}",
-            serde_json::to_string_pretty(&schema).unwrap_or_default()
-        ));
-    }
+    append_json_instance_example(
+        &mut messages,
+        r#"{"sections":[{"name":"1 Introduction","level":1,"line":1,"starts_with":"This paper presents..."}],"partial_section":null}"#,
+    );
 
     messages
 }
@@ -355,15 +347,14 @@ pub fn extraction_prompt_json(
     section_name: &str,
     doc_type_hint: &str,
 ) -> Vec<ChatMessage> {
-    let (mut messages, tools) = extraction_prompt(section_raw_text, section_name, doc_type_hint);
+    let (mut messages, _tools) = extraction_prompt(section_raw_text, section_name, doc_type_hint);
 
-    let schema = &tools[0].parameters;
-    if let Some(user_msg) = messages.last_mut() {
-        user_msg.content.push_str(&format!(
-            "\n\nRespond with a JSON object matching this schema:\n{}",
-            serde_json::to_string_pretty(schema).unwrap_or_default()
-        ));
-    }
+    append_json_instance_example(
+        &mut messages,
+        &format!(
+            "{{\"content\":\"## {section_name}\\nCleaned section text with noise removed...\"}}"
+        ),
+    );
 
     messages
 }
@@ -445,16 +436,20 @@ pub fn extraction_noise_prompt_json(
     section_name: &str,
     doc_type_hint: &str,
 ) -> Vec<ChatMessage> {
-    let (mut messages, tools) =
+    let (mut messages, _tools) =
         extraction_noise_prompt(section_text, section_name, doc_type_hint);
 
-    let schema = &tools[0].parameters;
-    if let Some(user_msg) = messages.last_mut() {
-        user_msg.content.push_str(&format!(
-            "\n\nRespond with a JSON object matching this schema:\n{}",
-            serde_json::to_string_pretty(schema).unwrap_or_default()
-        ));
+    if let Some(system) = messages.first_mut() {
+        // JSON mode must not ask for tool calls.
+        system.content = system.content.replace(
+            "Call report_noise with your findings.",
+            "Respond with a single JSON object only — never return a JSON Schema.",
+        );
     }
+    append_json_instance_example(
+        &mut messages,
+        r#"{"noise_regions":[{"start":"Ophthalmology Retina","end":"DOI: 10.1002/example","replace":"","reason":"running header"}]}"#,
+    );
 
     messages
 }

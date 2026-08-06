@@ -1183,8 +1183,20 @@ async fn auto_extract_metadata(
     }
 
     // Update fields (year, abstract, journal, DOI)
+    // Year maps to the core `entries.date` column (UI/list year comes from there),
+    // not only entry_fields — writing only to entry_fields left year invisible in the UI.
     if let Some(ref year) = metadata.year
         && !year.is_empty() {
+            if let Err(e) = sqlx::query(
+                "UPDATE entries SET date = ?, date_modified = datetime('now') WHERE id = ?",
+            )
+            .bind(year)
+            .bind(entry_id)
+            .execute(db)
+            .await
+            {
+                tracing::warn!("Failed to update date/year for entry {}: {}", entry_id, e);
+            }
             upsert_entry_field(db, entry_id, "date", year).await;
         }
     if let Some(ref abs) = metadata.abstract_text
@@ -1274,8 +1286,18 @@ async fn execute_rag_index(
     let embed_config = crate::rag::embeddings::resolve_embedding_config(db).await?;
     let dimension = match crate::rag::embeddings::probe_dimension(&embed_config).await {
         Ok(d) => d,
-        Err(_) => crate::rag::embeddings::known_dimension(&embed_config.provider_type, &embed_config.model)
-            .ok_or_else(|| "Cannot determine embedding dimension".to_string())?,
+        Err(probe_err) => {
+            let known = crate::rag::embeddings::known_dimension(
+                &embed_config.provider_type,
+                &embed_config.model,
+            );
+            known.ok_or_else(|| {
+                format!(
+                    "Cannot determine embedding dimension for {} model '{}': {}",
+                    embed_config.provider_type, embed_config.model, probe_err
+                )
+            })?
+        }
     };
 
     if cancel_flag.load(Ordering::Relaxed) { return Err("Job cancelled".to_string()); }

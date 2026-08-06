@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::llm::prompts;
 use crate::llm::provider::{
@@ -7,10 +7,52 @@ use crate::llm::provider::{
 };
 use std::sync::atomic::AtomicBool;
 
+/// Accept JSON numbers or numeric strings (common with local tool-calling models).
+fn deserialize_f32_lenient<'de, D>(deserializer: D) -> Result<f32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct F32Visitor;
+
+    impl<'de> Visitor<'de> for F32Visitor {
+        type Value = f32;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a float or a stringified float")
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<f32, E> {
+            Ok(v as f32)
+        }
+
+        fn visit_f32<E: de::Error>(self, v: f32) -> Result<f32, E> {
+            Ok(v)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<f32, E> {
+            Ok(v as f32)
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<f32, E> {
+            Ok(v as f32)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<f32, E> {
+            v.parse::<f32>().map_err(E::custom)
+        }
+    }
+
+    deserializer.deserialize_any(F32Visitor)
+}
+
 /// Result of document classification (Stage 1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassificationResult {
     pub document_type: String,
+    #[serde(deserialize_with = "deserialize_f32_lenient")]
     pub confidence: f32,
     pub language: String,
     pub reasoning: String,

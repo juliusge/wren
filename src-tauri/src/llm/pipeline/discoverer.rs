@@ -425,7 +425,7 @@ fn parse_discovery_response(
             }
 
     // It's valid to have 0 sections in a chunk (chunk might be all within one section)
-    Ok(sections)
+    Ok(filter_discovered_sections(sections))
 }
 
 /// Parse JSON-mode discovery response.
@@ -442,7 +442,7 @@ fn parse_discovery_json(content: &str) -> Result<DiscoveryResult, LlmError> {
     // Try parse with fence-stripping + control-char sanitization
     if let Ok(parsed) = parse_llm_json::<JsonDiscoveryResponse>(content) {
         return Ok(DiscoveryResult {
-            sections: parsed.sections,
+            sections: filter_discovered_sections(parsed.sections),
             chunks_processed: 1,
         });
     }
@@ -456,7 +456,7 @@ fn parse_discovery_json(content: &str) -> Result<DiscoveryResult, LlmError> {
         && let Ok(parsed) = parse_llm_json::<JsonDiscoveryResponse>(json_str) {
             tracing::debug!("Extracted discovery JSON from mixed text/JSON response");
             return Ok(DiscoveryResult {
-                sections: parsed.sections,
+                sections: filter_discovered_sections(parsed.sections),
                 chunks_processed: 1,
             });
         }
@@ -466,7 +466,7 @@ fn parse_discovery_json(content: &str) -> Result<DiscoveryResult, LlmError> {
         && let Ok(sections) = parse_llm_json::<Vec<DiscoveredSection>>(arr_str) {
             tracing::debug!("Extracted discovery sections array from mixed response");
             return Ok(DiscoveryResult {
-                sections,
+                sections: filter_discovered_sections(sections),
                 chunks_processed: 1,
             });
         }
@@ -475,6 +475,41 @@ fn parse_discovery_json(content: &str) -> Result<DiscoveryResult, LlmError> {
         "Failed to parse discovery JSON (tried strict, embedded object, embedded array)\nContent: {}",
         &content[..content.len().min(500)]
     )))
+}
+
+/// Drop sections that look like bibliography entries (common with weak local models).
+fn filter_discovered_sections(sections: Vec<DiscoveredSection>) -> Vec<DiscoveredSection> {
+    sections
+        .into_iter()
+        .filter(|section| {
+            if is_likely_bibliography_entry(section) {
+                tracing::warn!(
+                    "Skipping bibliography-like discovery section: '{}'",
+                    section.name
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect()
+}
+
+/// Heuristic: numbered citation lines like "21. Zhou, Chia, Wagner, … et al.: Title".
+fn is_likely_bibliography_entry(section: &DiscoveredSection) -> bool {
+    let name = section.name.trim();
+    let bytes = name.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 0 || i >= bytes.len() || bytes[i] != b'.' {
+        return false;
+    }
+    let rest = name[i + 1..].trim_start();
+    let lower = rest.to_lowercase();
+    let comma_count = rest.matches(',').count();
+    comma_count >= 3 || lower.contains("et al")
 }
 
 /// Extract the outermost `{...}` JSON object from text that may contain

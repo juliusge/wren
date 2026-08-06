@@ -465,19 +465,14 @@ async fn extract_section_noise_json(
         LlmError::ParseError("No content in JSON noise detection response".to_string())
     })?;
 
-    #[derive(Deserialize)]
-    struct JsonNoiseResponse {
-        noise_regions: Vec<NoiseRegion>,
-    }
-
-    let parsed: JsonNoiseResponse = parse_llm_json(content).map_err(|e| {
+    let noise_regions = parse_noise_regions_json(content).map_err(|e| {
         LlmError::ParseError(format!(
             "Failed to parse noise detection JSON for '{}': {e}\nContent: {content}",
             section_name
         ))
     })?;
 
-    apply_noise_removals(raw_text, &parsed.noise_regions).map_err(|e| {
+    apply_noise_removals(raw_text, &noise_regions).map_err(|e| {
         LlmError::ParseError(format!(
             "Noise detection rejected for '{}': {e}",
             section_name
@@ -811,6 +806,110 @@ fn sanitize_noise_regions(mut regions: Vec<NoiseRegion>) -> Vec<NoiseRegion> {
     regions
 }
 
+/// Parse noise regions from JSON-mode content.
+///
+/// Handles:
+/// - normal `{"noise_regions":[...]}`
+/// - schema-echo shells with values under `properties.noise_regions.items.properties`
+/// - text "tool calls" like `{"name":"report_noise","parameters":{"noise_regions":...}}`
+///   where `noise_regions` may be an array or a stringified JSON array
+fn parse_noise_regions_json(content: &str) -> Result<Vec<NoiseRegion>, String> {
+    #[derive(Deserialize)]
+    struct JsonNoiseResponse {
+        #[serde(deserialize_with = "deserialize_noise_regions_lenient")]
+        noise_regions: Vec<NoiseRegion>,
+    }
+
+    if let Ok(parsed) = parse_llm_json::<JsonNoiseResponse>(content) {
+        return Ok(sanitize_noise_regions(parsed.noise_regions));
+    }
+
+    if let Some(regions) = extract_json_tool_call_noise(content) {
+        return Ok(sanitize_noise_regions(regions));
+    }
+
+    let value: serde_json::Value =
+        parse_llm_json(content).map_err(|e| format!("invalid JSON: {e}"))?;
+    if let Some(regions) = unwrap_schema_echo_noise(&value) {
+        return Ok(sanitize_noise_regions(regions));
+    }
+
+    Err("missing field `noise_regions`".to_string())
+}
+
+/// Accept a JSON array or a string containing a JSON array (common with weak tool calling).
+fn deserialize_noise_regions_lenient<'de, D>(deserializer: D) -> Result<Vec<NoiseRegion>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Array(_) => serde_json::from_value(value).map_err(D::Error::custom),
+        serde_json::Value::String(s) => {
+            parse_llm_json::<Vec<NoiseRegion>>(&s).map_err(D::Error::custom)
+        }
+        other => Err(D::Error::custom(format!(
+            "noise_regions must be array or string, got {other}"
+        ))),
+    }
+}
+
+/// Recover noise regions from a JSON object that looks like a textual tool call.
+fn extract_json_tool_call_noise(content: &str) -> Option<Vec<NoiseRegion>> {
+    let value: serde_json::Value = parse_llm_json(content).ok()?;
+    let name = value.get("name")?.as_str()?;
+    if name != "report_noise" {
+        return None;
+    }
+    let params = value.get("parameters").or_else(|| value.get("arguments"))?;
+    let regions_val = params.get("noise_regions")?;
+    match regions_val {
+        serde_json::Value::Array(_) => serde_json::from_value(regions_val.clone()).ok(),
+        serde_json::Value::String(s) => parse_llm_json::<Vec<NoiseRegion>>(s).ok(),
+        _ => None,
+    }
+}
+
+/// Recover a single NoiseRegion when the model echoes a JSON Schema and puts
+/// the actual values into `properties.*.items.properties`.
+fn unwrap_schema_echo_noise(value: &serde_json::Value) -> Option<Vec<NoiseRegion>> {
+    let item_props = value
+        .get("properties")?
+        .get("noise_regions")?
+        .get("items")?
+        .get("properties")?;
+
+    // Real schema echo still has nested `{ "type": "string" }` for fields.
+    if item_props
+        .get("start")
+        .and_then(|v| v.get("type"))
+        .is_some()
+    {
+        return None;
+    }
+
+    let start = item_props.get("start")?.as_str()?.to_string();
+    let end = item_props.get("end")?.as_str()?.to_string();
+    let replace = item_props
+        .get("replace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let reason = item_props
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Some(vec![NoiseRegion {
+        start,
+        end,
+        replace,
+        reason,
+    }])
+}
+
 /// Parse noise-detection response from tool calls.
 fn parse_noise_response(response: &CompletionResponse) -> Result<Vec<NoiseRegion>, LlmError> {
     // Check tool calls for report_noise
@@ -818,6 +917,7 @@ fn parse_noise_response(response: &CompletionResponse) -> Result<Vec<NoiseRegion
         if tc.name == "report_noise" {
             #[derive(Deserialize)]
             struct ReportNoiseArgs {
+                #[serde(deserialize_with = "deserialize_noise_regions_lenient")]
                 noise_regions: Vec<NoiseRegion>,
             }
 
@@ -837,13 +937,8 @@ fn parse_noise_response(response: &CompletionResponse) -> Result<Vec<NoiseRegion
 
     // Fallback: try parsing content as JSON (also covers malformed tool calls)
     if let Some(ref content) = response.content {
-        #[derive(Deserialize)]
-        struct JsonNoiseResponse {
-            noise_regions: Vec<NoiseRegion>,
-        }
-
-        if let Ok(parsed) = parse_llm_json::<JsonNoiseResponse>(content) {
-            return Ok(sanitize_noise_regions(parsed.noise_regions));
+        if let Ok(regions) = parse_noise_regions_json(content) {
+            return Ok(regions);
         }
 
         // Try extracting from fake XML tool calls (models like DeepSeek output these as text)
@@ -1073,5 +1168,48 @@ Some real document content here.
         assert!(!is_meta_commentary_line("the experiment was conducted in 2024"));
         assert!(!is_meta_commentary_line("i'll discuss the results in section 4"));
         assert!(!is_meta_commentary_line(""));
+    }
+
+    #[test]
+    fn test_parse_noise_regions_schema_echo() {
+        let content = r#"{
+  "properties": {
+    "noise_regions": {
+      "items": {
+        "properties": {
+          "end": "DOI: 10.1002/gra.13437",
+          "reason": "Running header with journal name",
+          "replace": "",
+          "start": "Ophthalmology Retina"
+        },
+        "required": ["start", "end", "replace", "reason"],
+        "type": "object"
+      },
+      "maxItems": 20,
+      "type": "array"
+    }
+  },
+  "required": ["noise_regions"],
+  "type": "object"
+}"#;
+        let regions = parse_noise_regions_json(content).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start, "Ophthalmology Retina");
+        assert_eq!(regions[0].end, "DOI: 10.1002/gra.13437");
+        assert_eq!(regions[0].reason, "Running header with journal name");
+    }
+
+    #[test]
+    fn test_parse_noise_regions_text_tool_call_stringified() {
+        let content = r#"{
+  "name": "report_noise",
+  "parameters": {
+    "noise_regions": "[{\"start\": \"Ophthalmology Retina\", \"end\": \"DOI: 10.1002/gra.13437\", \"reason\": \"Running header\", \"replace\": \"\"}]"
+  }
+}"#;
+        let regions = parse_noise_regions_json(content).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start, "Ophthalmology Retina");
+        assert_eq!(regions[0].reason, "Running header");
     }
 }

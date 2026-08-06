@@ -76,13 +76,16 @@ interface SettingsState {
   loadFromBackend: () => Promise<void>;
 }
 
-export const LLM_PROVIDER_DEFAULTS: Record<string, { baseUrl: string; defaultModel: string; requiresApiKey: boolean }> = {
-  openai: { baseUrl: "https://api.openai.com/v1", defaultModel: "gpt-4o-mini", requiresApiKey: true },
-  anthropic: { baseUrl: "https://api.anthropic.com/v1", defaultModel: "claude-sonnet-4-20250514", requiresApiKey: true },
-  gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta", defaultModel: "gemini-2.0-flash", requiresApiKey: true },
-  ollama: { baseUrl: "http://localhost:11434", defaultModel: "llama3.2", requiresApiKey: false },
-  ollama_cloud: { baseUrl: "https://ollama.com", defaultModel: "", requiresApiKey: true },
-  omlx: { baseUrl: "http://localhost:1234/v1", defaultModel: "", requiresApiKey: true },
+export const LLM_PROVIDER_DEFAULTS: Record<
+  string,
+  { baseUrl: string; defaultModel: string; requiresApiKey: boolean; defaultEmbeddingModel?: string }
+> = {
+  openai: { baseUrl: "https://api.openai.com/v1", defaultModel: "gpt-4o-mini", requiresApiKey: true, defaultEmbeddingModel: "text-embedding-3-small" },
+  anthropic: { baseUrl: "https://api.anthropic.com/v1", defaultModel: "claude-sonnet-4-20250514", requiresApiKey: true, defaultEmbeddingModel: "" },
+  gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta", defaultModel: "gemini-2.0-flash", requiresApiKey: true, defaultEmbeddingModel: "text-embedding-004" },
+  ollama: { baseUrl: "http://localhost:11434", defaultModel: "llama3.2", requiresApiKey: false, defaultEmbeddingModel: "nomic-embed-text" },
+  ollama_cloud: { baseUrl: "https://ollama.com", defaultModel: "", requiresApiKey: true, defaultEmbeddingModel: "nomic-embed-text" },
+  omlx: { baseUrl: "http://localhost:1234/v1", defaultModel: "", requiresApiKey: true, defaultEmbeddingModel: "" },
 };
 
 export const useSettingsStore = create<SettingsState>()(
@@ -183,23 +186,30 @@ export const useSettingsStore = create<SettingsState>()(
       },
       setLlmProvider: async (provider) => {
         const prev = get().llmProvider;
+        const prevEmbedding = get().cloudEmbeddingModel;
         const defaults = LLM_PROVIDER_DEFAULTS[provider] ?? LLM_PROVIDER_DEFAULTS.openai;
         const keys = get().llmApiKeys;
+        const nextEmbedding = defaults.defaultEmbeddingModel ?? prevEmbedding;
         set({
           llmProvider: provider,
           llmApiKey: keys[provider] || "",
           llmBaseUrl: defaults.baseUrl,
           llmModel: defaults.defaultModel,
+          cloudEmbeddingModel: nextEmbedding,
         });
         try {
-          await Promise.all([
+          const updates = [
             updateSetting("llm_provider", provider),
             updateSetting("llm_base_url", defaults.baseUrl),
             updateSetting("llm_model", defaults.defaultModel),
-          ]);
+          ];
+          if (defaults.defaultEmbeddingModel !== undefined) {
+            updates.push(updateSetting("cloud_embedding_model", defaults.defaultEmbeddingModel));
+          }
+          await Promise.all(updates);
         } catch (err) {
           console.error("Failed to update llm_provider setting:", err);
-          set({ llmProvider: prev });
+          set({ llmProvider: prev, cloudEmbeddingModel: prevEmbedding });
           toast.error("Failed to update setting");
         }
       },
